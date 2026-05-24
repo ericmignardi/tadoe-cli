@@ -1,8 +1,10 @@
 import chalk from 'chalk';
+import prompts from 'prompts';
 import { Config } from './config.js';
 import { ChatMessage, saveSession, loadSession, listSessions, deleteSession } from './sessions.js';
 import { toolsList } from './tools.js';
 import { saveMemory } from './memory.js';
+import { keychainAvailable, keychainSet, keychainDelete } from './keychain.js';
 
 export interface CommandContext {
   config: Config;
@@ -11,6 +13,7 @@ export interface CommandContext {
   state: {
     messages: ChatMessage[];
     sessionId: string;
+    persistedCount: number;
     memory: string;
   };
 }
@@ -22,7 +25,7 @@ export interface CommandResult {
   clear?: boolean;
 }
 
-export type CommandHandler = (ctx: CommandContext) => CommandResult | void;
+export type CommandHandler = (ctx: CommandContext) => Promise<CommandResult | void> | CommandResult | void;
 
 function printHelp() {
   console.log('');
@@ -31,6 +34,8 @@ function printHelp() {
   console.log(`  ${chalk.yellow('/help')}                   Show this menu`);
   console.log(`  ${chalk.yellow('/clear')}                  Clear screen`);
   console.log(`  ${chalk.yellow('/tools')}                  List agent tools`);
+  console.log(`  ${chalk.yellow('/login')}                  Store API key in OS keychain`);
+  console.log(`  ${chalk.yellow('/logout')}                 Remove API key from OS keychain`);
   console.log(`  ${chalk.yellow('/quit')}                   Exit session`);
   console.log(`  ${chalk.yellow('/chat list')}              List saved sessions`);
   console.log(`  ${chalk.yellow('/chat save <name>')}       Save session`);
@@ -45,6 +50,8 @@ function printHelp() {
   console.log(`  ${chalk.yellow('@file.ts')}                Inject file contents`);
   console.log(`  ${chalk.yellow('@src/')}                   Inject directory tree`);
   console.log(`  ${chalk.yellow('!git status')}             Run shell command`);
+  console.log(`  ${chalk.yellow('trailing \\\\')}              Continue on next line`);
+  console.log(`  ${chalk.yellow('↑ / ↓')}                   Recall history`);
   console.log('');
 }
 
@@ -60,13 +67,13 @@ function printTools() {
   console.log('');
 }
 
-const chat: CommandHandler = ({ config, args, state }) => {
+const chat: CommandHandler = async ({ config, args, state }) => {
   const sub = args[0]?.toLowerCase();
   const tag = args.slice(1).join('_').trim();
 
   switch (sub) {
     case 'list': {
-      const list = listSessions(config.sessionsDir);
+      const list = await listSessions(config.sessionsDir);
       if (list.length === 0) {
         console.log(chalk.dim('\n  No saved sessions.\n'));
         return;
@@ -80,17 +87,25 @@ const chat: CommandHandler = ({ config, args, state }) => {
       return;
     }
     case 'save': {
-      if (!tag) return void console.log(chalk.red('  Usage: /chat save <name>'));
+      if (!tag) {
+        console.log(chalk.red('  Usage: /chat save <name>'));
+        return;
+      }
       state.sessionId = tag;
-      saveSession(config.sessionsDir, state.sessionId, state.messages);
+      await saveSession(config.sessionsDir, state.sessionId, state.messages);
+      state.persistedCount = state.messages.length;
       console.log(chalk.green(`  ✓ Session saved: ${state.sessionId}\n`));
       return;
     }
     case 'resume': {
-      if (!tag) return void console.log(chalk.red('  Usage: /chat resume <name>'));
+      if (!tag) {
+        console.log(chalk.red('  Usage: /chat resume <name>'));
+        return;
+      }
       try {
-        state.messages = loadSession(config.sessionsDir, tag);
+        state.messages = await loadSession(config.sessionsDir, tag);
         state.sessionId = tag;
+        state.persistedCount = state.messages.length;
         console.log(chalk.green(`  ✓ Resumed: ${state.sessionId} (${state.messages.length} messages)\n`));
       } catch (e) {
         console.log(chalk.red(`  ${(e as Error).message}`));
@@ -98,8 +113,11 @@ const chat: CommandHandler = ({ config, args, state }) => {
       return;
     }
     case 'delete': {
-      if (!tag) return void console.log(chalk.red('  Usage: /chat delete <name>'));
-      deleteSession(config.sessionsDir, tag);
+      if (!tag) {
+        console.log(chalk.red('  Usage: /chat delete <name>'));
+        return;
+      }
+      await deleteSession(config.sessionsDir, tag);
       console.log(chalk.green(`  ✓ Deleted: ${tag}`));
       return;
     }
@@ -108,7 +126,7 @@ const chat: CommandHandler = ({ config, args, state }) => {
   }
 };
 
-const memory: CommandHandler = ({ config, args, state }) => {
+const memory: CommandHandler = async ({ config, args, state }) => {
   const sub = args[0]?.toLowerCase();
   const text = args.slice(1).join(' ').trim();
 
@@ -125,20 +143,59 @@ const memory: CommandHandler = ({ config, args, state }) => {
       return;
     }
     case 'add': {
-      if (!text) return void console.log(chalk.red('  Usage: /memory add <text>'));
+      if (!text) {
+        console.log(chalk.red('  Usage: /memory add <text>'));
+        return;
+      }
       state.memory = state.memory ? `${state.memory}\n${text}` : text;
-      saveMemory(config.memoryFile, state.memory);
+      await saveMemory(config.memoryFile, state.memory);
       console.log(chalk.green('  ✓ Memory updated.'));
       return;
     }
     case 'clear': {
       state.memory = '';
-      saveMemory(config.memoryFile, state.memory);
+      await saveMemory(config.memoryFile, state.memory);
       console.log(chalk.green('  ✓ Memory cleared.'));
       return;
     }
     default:
       console.log(chalk.red('  Usage: /memory [list|add|clear]'));
+  }
+};
+
+const login: CommandHandler = async () => {
+  if (!(await keychainAvailable())) {
+    console.log(chalk.red('  OS keychain is unavailable on this system.'));
+    console.log(chalk.dim('  Falling back: set TADOE_API_KEY in your environment instead.'));
+    return;
+  }
+  const { value } = await prompts({
+    type: 'password',
+    name: 'value',
+    message: 'Enter API key (stored securely in OS keychain)',
+  });
+  if (!value) {
+    console.log(chalk.dim('  Cancelled.'));
+    return;
+  }
+  const result = await keychainSet(value);
+  if (result.ok) {
+    console.log(chalk.green('  ✓ API key saved to OS keychain. Restart Tadoe to use it.\n'));
+  } else {
+    console.log(chalk.red(`  Failed to save: ${result.error}`));
+  }
+};
+
+const logout: CommandHandler = async () => {
+  if (!(await keychainAvailable())) {
+    console.log(chalk.dim('  OS keychain is unavailable on this system; nothing to remove.'));
+    return;
+  }
+  const result = await keychainDelete();
+  if (result.ok) {
+    console.log(chalk.green('  ✓ API key removed from OS keychain. Restart Tadoe to apply.\n'));
+  } else {
+    console.log(chalk.red(`  Failed to remove: ${result.error}`));
   }
 };
 
@@ -148,6 +205,8 @@ export const commandHandlers: Record<string, CommandHandler> = {
   clear: () => ({ clear: true }),
   exit: () => ({ exit: true }),
   quit: () => ({ exit: true }),
+  login,
+  logout,
   chat,
   memory,
 };

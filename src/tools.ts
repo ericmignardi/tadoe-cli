@@ -1,7 +1,16 @@
-import fs from 'fs';
+import fs from 'fs/promises';
 import path from 'path';
 import { FILE_READ_LIMIT_BYTES, SKIP_DIR_NAMES } from './constants.js';
 import { runShell, formatShellResult } from './shell.js';
+
+async function exists(p: string): Promise<boolean> {
+  try {
+    await fs.access(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function resolveWithinCwd(targetPath: string): { ok: true; resolved: string } | { ok: false; error: string } {
   const resolved = path.resolve(process.cwd(), targetPath);
@@ -48,24 +57,26 @@ export const toolsList: ToolDefinition[] = [
       const guard = resolveWithinCwd(args.path);
       if (!guard.ok) return guard.error;
       const resolvedPath = guard.resolved;
-      if (!fs.existsSync(resolvedPath)) {
+      let stat;
+      try {
+        stat = await fs.stat(resolvedPath);
+      } catch {
         return `Error: File not found at ${resolvedPath}`;
       }
-      const stat = fs.statSync(resolvedPath);
       if (!stat.isFile()) {
         return `Error: Path ${resolvedPath} is a directory, not a file.`;
       }
       if (stat.size > FILE_READ_LIMIT_BYTES) {
-        const fd = fs.openSync(resolvedPath, 'r');
+        const handle = await fs.open(resolvedPath, 'r');
         try {
           const buf = Buffer.alloc(FILE_READ_LIMIT_BYTES);
-          const bytesRead = fs.readSync(fd, buf, 0, FILE_READ_LIMIT_BYTES, 0);
+          const { bytesRead } = await handle.read(buf, 0, FILE_READ_LIMIT_BYTES, 0);
           return buf.slice(0, bytesRead).toString('utf-8') + '\n\n... [File content truncated]';
         } finally {
-          fs.closeSync(fd);
+          await handle.close();
         }
       }
-      return fs.readFileSync(resolvedPath, 'utf-8');
+      return fs.readFile(resolvedPath, 'utf-8');
     },
   },
   {
@@ -85,10 +96,8 @@ export const toolsList: ToolDefinition[] = [
       if (!guard.ok) return guard.error;
       const resolvedPath = guard.resolved;
       const dir = path.dirname(resolvedPath);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-      }
-      fs.writeFileSync(resolvedPath, args.content, 'utf-8');
+      await fs.mkdir(dir, { recursive: true });
+      await fs.writeFile(resolvedPath, args.content, 'utf-8');
       return `Successfully wrote file to ${args.path}`;
     },
   },
@@ -111,15 +120,15 @@ export const toolsList: ToolDefinition[] = [
       const guard = resolveWithinCwd(targetDir);
       if (!guard.ok) return guard.error;
       const resolvedPath = guard.resolved;
-      if (!fs.existsSync(resolvedPath)) {
+      if (!(await exists(resolvedPath))) {
         return `Error: Directory not found at ${resolvedPath}`;
       }
-      const stat = fs.statSync(resolvedPath);
+      const stat = await fs.stat(resolvedPath);
       if (!stat.isDirectory()) {
         return `Error: Path ${resolvedPath} is a file, not a directory.`;
       }
 
-      const files = fs.readdirSync(resolvedPath);
+      const files = await fs.readdir(resolvedPath);
       if (files.length === 0) return 'Directory is empty.';
 
       let output = `Contents of directory "${targetDir}":\n`;
@@ -127,7 +136,7 @@ export const toolsList: ToolDefinition[] = [
         if (SKIP_DIR_NAMES.has(file)) continue;
         const fullPath = path.join(resolvedPath, file);
         try {
-          const fstat = fs.statSync(fullPath);
+          const fstat = await fs.stat(fullPath);
           output += fstat.isDirectory()
             ? `📁 ${file}/\n`
             : `📄 ${file} (${fstat.size} bytes)\n`;

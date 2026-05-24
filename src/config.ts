@@ -1,7 +1,9 @@
-import fs from 'fs';
+import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
 import dotenv from 'dotenv';
+import { SECRET_FILE_MODE } from './constants.js';
+import { keychainGet } from './keychain.js';
 
 export interface Config {
   apiUrl: string;
@@ -10,6 +12,7 @@ export interface Config {
   safeMode: boolean;
   sessionsDir: string;
   memoryFile: string;
+  historyFile: string;
   configFile: string;
 }
 
@@ -22,6 +25,7 @@ const DEFAULTS: Config = {
   safeMode: true,
   sessionsDir: path.join(TADOE_DIR, 'sessions'),
   memoryFile: path.join(TADOE_DIR, 'memory.json'),
+  historyFile: path.join(TADOE_DIR, 'history'),
   configFile: path.join(TADOE_DIR, 'config.json'),
 };
 
@@ -31,24 +35,37 @@ function preferIPv4(url: string): string {
   return url.replace(/\/\/localhost([:/])/i, '//127.0.0.1$1');
 }
 
-export function loadConfig(): Config {
+async function exists(p: string): Promise<boolean> {
+  try {
+    await fs.access(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function loadConfig(): Promise<Config> {
   dotenv.config();
 
-  if (!fs.existsSync(TADOE_DIR)) {
-    fs.mkdirSync(TADOE_DIR, { recursive: true });
+  if (!(await exists(TADOE_DIR))) {
+    await fs.mkdir(TADOE_DIR, { recursive: true });
   }
 
   let fileConfig: Partial<Config> = {};
-  if (fs.existsSync(DEFAULTS.configFile)) {
+  if (await exists(DEFAULTS.configFile)) {
     try {
-      fileConfig = JSON.parse(fs.readFileSync(DEFAULTS.configFile, 'utf-8'));
+      fileConfig = JSON.parse(await fs.readFile(DEFAULTS.configFile, 'utf-8'));
     } catch {
       console.warn(`[Config] Failed to parse ${DEFAULTS.configFile}. Using defaults.`);
     }
   }
 
   const apiUrl = preferIPv4(process.env.TADOE_API_URL || fileConfig.apiUrl || DEFAULTS.apiUrl);
-  const apiKey = process.env.TADOE_API_KEY || fileConfig.apiKey || DEFAULTS.apiKey;
+
+  // Priority: env var → OS keychain → config file → default. The keychain
+  // is preferred to plaintext config storage when present.
+  const keychainKey = await keychainGet();
+  const apiKey = process.env.TADOE_API_KEY || keychainKey || fileConfig.apiKey || DEFAULTS.apiKey;
   const model = process.env.TADOE_MODEL || fileConfig.model || DEFAULTS.model;
 
   let safeMode = DEFAULTS.safeMode;
@@ -60,9 +77,10 @@ export function loadConfig(): Config {
 
   const sessionsDir = process.env.TADOE_SESSIONS_DIR || fileConfig.sessionsDir || DEFAULTS.sessionsDir;
   const memoryFile = process.env.TADOE_MEMORY_FILE || fileConfig.memoryFile || DEFAULTS.memoryFile;
+  const historyFile = process.env.TADOE_HISTORY_FILE || fileConfig.historyFile || DEFAULTS.historyFile;
 
-  if (!fs.existsSync(sessionsDir)) {
-    fs.mkdirSync(sessionsDir, { recursive: true });
+  if (!(await exists(sessionsDir))) {
+    await fs.mkdir(sessionsDir, { recursive: true });
   }
 
   return {
@@ -72,6 +90,7 @@ export function loadConfig(): Config {
     safeMode,
     sessionsDir,
     memoryFile,
+    historyFile,
     configFile: DEFAULTS.configFile,
   };
 }
@@ -102,8 +121,15 @@ export async function detectActiveModel(config: Config): Promise<string> {
   return 'local-model';
 }
 
-export function saveConfig(partialConfig: Partial<Config>) {
-  const current = loadConfig();
+/**
+ * Persist non-secret config to disk. The apiKey is NEVER written here — it
+ * lives in the OS keychain (see keychain.ts) or in the user's env.
+ */
+export async function saveConfig(partialConfig: Partial<Omit<Config, 'apiKey'>>): Promise<void> {
+  const current = await loadConfig();
   const updated = { ...current, ...partialConfig };
-  fs.writeFileSync(current.configFile, JSON.stringify(updated, null, 2), 'utf-8');
+  // Strip apiKey before persisting so it never lands in plaintext.
+  const { apiKey: _apiKey, ...safe } = updated;
+  void _apiKey;
+  await fs.writeFile(current.configFile, JSON.stringify(safe, null, 2), { encoding: 'utf-8', mode: SECRET_FILE_MODE });
 }

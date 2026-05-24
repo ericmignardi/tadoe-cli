@@ -1,5 +1,4 @@
 import chalk from 'chalk';
-import readline from 'readline';
 import ora, { Ora } from 'ora';
 import prompts from 'prompts';
 import { marked } from 'marked';
@@ -8,11 +7,12 @@ import { markedTerminal } from 'marked-terminal';
 import { Config, detectActiveModel } from './config.js';
 import { printAsciiLogo } from './ascii.js';
 import { parseInput } from './parser.js';
-import { ChatMessage, saveSession, loadSession } from './sessions.js';
+import { ChatMessage, appendMessages, loadSession } from './sessions.js';
 import { runAgentLoop, AgentHooks } from './llm.js';
 import { commandHandlers } from './commands.js';
 import { loadMemory } from './memory.js';
 import { runShell } from './shell.js';
+import { createInputSession } from './input.js';
 import { TOOL_RESULT_PREVIEW_CHARS, WRITE_PREVIEW_CHARS } from './constants.js';
 
 // markedTerminal's types are not aligned with marked v12; one cast is enough.
@@ -23,16 +23,6 @@ marked.use(markedTerminal({
 }) as unknown as Parameters<typeof marked.use>[0]);
 
 export { loadMemory };
-
-function renderAssistantBlock(text: string): string {
-  const border = chalk.magenta('│');
-  try {
-    const rendered = marked.parse(text) as string;
-    return rendered.split('\n').map(line => `  ${border} ${line}`).join('\n');
-  } catch {
-    return text.split('\n').map(line => `  ${border} ${line}`).join('\n');
-  }
-}
 
 /** Stateful line-aware writer that prefixes every new line with the magenta border. */
 function createStreamingWriter() {
@@ -69,13 +59,6 @@ function createStreamingWriter() {
       return anyOutput;
     },
   };
-}
-
-function promptUser(rl: readline.Interface): Promise<string | null> {
-  return new Promise(resolve => {
-    rl.question(chalk.bold.magenta('\n> '), answer => resolve(answer));
-    rl.once('close', () => resolve(null));
-  });
 }
 
 async function runShellEscape(command: string): Promise<void> {
@@ -147,27 +130,32 @@ async function confirmTool(name: string, args: any): Promise<boolean> {
   return true;
 }
 
+function printHeader(activeModel: string, activeConfig: Config) {
+  console.log(
+    chalk.dim('  Model: ') + chalk.bold.white(activeModel)
+    + chalk.dim('  •  ') + chalk.dim(activeConfig.apiUrl)
+  );
+  console.log(chalk.dim(`  Safe mode: ${activeConfig.safeMode ? chalk.green('on') : chalk.red('off')}  •  /help for commands  •  /quit to exit\n`));
+}
+
 export async function startInteractiveSession(config: Config, initialSessionId?: string) {
   printAsciiLogo();
 
   const activeModel = await detectActiveModel(config);
-  console.log(
-    chalk.dim('  Model: ') + chalk.bold.white(activeModel)
-    + chalk.dim('  •  ') + chalk.dim(config.apiUrl)
-  );
-  console.log(chalk.dim(`  Safe mode: ${config.safeMode ? chalk.green('on') : chalk.red('off')}  •  /help for commands  •  /quit to exit\n`));
-
   const activeConfig = { ...config, model: activeModel };
+  printHeader(activeModel, activeConfig);
 
   const state = {
     messages: [] as ChatMessage[],
     sessionId: initialSessionId || `session_${Date.now()}`,
-    memory: loadMemory(activeConfig.memoryFile),
+    persistedCount: 0,
+    memory: await loadMemory(activeConfig.memoryFile),
   };
 
   if (initialSessionId) {
     try {
-      state.messages = loadSession(activeConfig.sessionsDir, initialSessionId);
+      state.messages = await loadSession(activeConfig.sessionsDir, initialSessionId);
+      state.persistedCount = state.messages.length;
       console.log(chalk.dim(`  Resumed session: ${initialSessionId} (${state.messages.length} messages)\n`));
     } catch (e) {
       console.log(chalk.red(`  Failed to resume: ${(e as Error).message}\n`));
@@ -175,31 +163,35 @@ export async function startInteractiveSession(config: Config, initialSessionId?:
     }
   }
 
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+  const input = await createInputSession(activeConfig.historyFile);
 
-  const exit = () => {
+  const exit = async () => {
     console.log(chalk.dim('\n  Saving session and exiting. Goodbye!\n'));
-    saveSession(activeConfig.sessionsDir, state.sessionId, state.messages);
-    rl.close();
+    const pending = state.messages.slice(state.persistedCount);
+    if (pending.length > 0) {
+      await appendMessages(activeConfig.sessionsDir, state.sessionId, pending);
+      state.persistedCount = state.messages.length;
+    }
+    input.close();
   };
 
   while (true) {
-    const rawInput = await promptUser(rl);
+    const rawInput = await input.prompt();
     if (rawInput === null) {
-      exit();
+      await exit();
       break;
     }
 
-    const input = rawInput.trim();
-    if (!input) continue;
+    const trimmed = rawInput.trim();
+    if (!trimmed) continue;
 
-    const lower = input.toLowerCase();
+    const lower = trimmed.toLowerCase();
     if (lower === 'exit' || lower === 'quit') {
-      exit();
+      await exit();
       break;
     }
 
-    const parsed = await parseInput(input);
+    const parsed = await parseInput(trimmed);
 
     if (parsed.type === 'shell') {
       await runShellEscape(parsed.content);
@@ -212,18 +204,14 @@ export async function startInteractiveSession(config: Config, initialSessionId?:
         console.log(chalk.red(`  Unknown command: /${parsed.commandName}. Type /help for commands.`));
         continue;
       }
-      const result = handler({ config: activeConfig, args: parsed.args || [], state }) || {};
+      const result = (await handler({ config: activeConfig, args: parsed.args || [], state })) || {};
       if (result.clear) {
         console.clear();
         printAsciiLogo();
-        console.log(
-          chalk.dim('  Model: ') + chalk.bold.white(activeModel)
-          + chalk.dim('  •  ') + chalk.dim(activeConfig.apiUrl)
-        );
-        console.log(chalk.dim(`  Safe mode: ${activeConfig.safeMode ? chalk.green('on') : chalk.red('off')}  •  /help for commands  •  /quit to exit\n`));
+        printHeader(activeModel, activeConfig);
       }
       if (result.exit) {
-        exit();
+        await exit();
         break;
       }
       continue;
@@ -305,6 +293,10 @@ export async function startInteractiveSession(config: Config, initialSessionId?:
     const tokenEstimate = Math.round(totalChars / 4);
     console.log(chalk.dim(`  ${elapsed}s  •  ~${tokenEstimate} tokens (session)\n`));
 
-    saveSession(activeConfig.sessionsDir, state.sessionId, state.messages);
+    const pending = state.messages.slice(state.persistedCount);
+    if (pending.length > 0) {
+      await appendMessages(activeConfig.sessionsDir, state.sessionId, pending);
+      state.persistedCount = state.messages.length;
+    }
   }
 }

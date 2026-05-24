@@ -1,4 +1,4 @@
-import fs from 'fs';
+import fs from 'fs/promises';
 import path from 'path';
 import { DIR_TREE_MAX_DEPTH, FILE_READ_LIMIT_BYTES, SKIP_DIR_NAMES } from './constants.js';
 
@@ -14,6 +14,15 @@ export interface ParsedInput {
   commandName?: string;
   args?: string[];
   injectedContext?: InjectedContext[];
+}
+
+async function exists(p: string): Promise<boolean> {
+  try {
+    await fs.access(p);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -47,7 +56,7 @@ export async function parseInput(input: string, baseDir: string = process.cwd())
     if (seen.has(absolutePath)) continue;
     seen.add(absolutePath);
 
-    if (!fs.existsSync(absolutePath)) {
+    if (!(await exists(absolutePath))) {
       resolvedContexts.push({
         path: targetPath,
         content: `Error: File or directory does not exist at ${absolutePath}`,
@@ -57,26 +66,26 @@ export async function parseInput(input: string, baseDir: string = process.cwd())
     }
 
     try {
-      const stat = fs.statSync(absolutePath);
+      const stat = await fs.stat(absolutePath);
       if (stat.isFile()) {
         let content: string;
         if (stat.size > FILE_READ_LIMIT_BYTES) {
-          const fd = fs.openSync(absolutePath, 'r');
+          const handle = await fs.open(absolutePath, 'r');
           try {
             const buf = Buffer.alloc(FILE_READ_LIMIT_BYTES);
-            const bytesRead = fs.readSync(fd, buf, 0, FILE_READ_LIMIT_BYTES, 0);
+            const { bytesRead } = await handle.read(buf, 0, FILE_READ_LIMIT_BYTES, 0);
             content = buf.slice(0, bytesRead).toString('utf-8') + '\n\n... [File content truncated]';
           } finally {
-            fs.closeSync(fd);
+            await handle.close();
           }
         } else {
-          content = fs.readFileSync(absolutePath, 'utf-8');
+          content = await fs.readFile(absolutePath, 'utf-8');
         }
         resolvedContexts.push({ path: targetPath, content, isDir: false });
       } else if (stat.isDirectory()) {
         resolvedContexts.push({
           path: targetPath,
-          content: listDirectoryTree(absolutePath, 0, DIR_TREE_MAX_DEPTH),
+          content: await listDirectoryTree(absolutePath, 0, DIR_TREE_MAX_DEPTH),
           isDir: true,
         });
       }
@@ -92,21 +101,21 @@ export async function parseInput(input: string, baseDir: string = process.cwd())
   return { type: 'text', content: input, injectedContext: resolvedContexts };
 }
 
-function listDirectoryTree(dirPath: string, currentDepth: number, maxDepth: number): string {
+async function listDirectoryTree(dirPath: string, currentDepth: number, maxDepth: number): Promise<string> {
   if (currentDepth > maxDepth) return '... [Max Depth Reached]';
 
   try {
-    const files = fs.readdirSync(dirPath);
+    const files = await fs.readdir(dirPath);
     const indent = '  '.repeat(currentDepth);
     let output = '';
 
     for (const file of files) {
       if (SKIP_DIR_NAMES.has(file)) continue;
       const fullPath = path.join(dirPath, file);
-      const stat = fs.statSync(fullPath);
+      const stat = await fs.stat(fullPath);
       if (stat.isDirectory()) {
         output += `${indent}📁 ${file}/\n`;
-        output += listDirectoryTree(fullPath, currentDepth + 1, maxDepth);
+        output += await listDirectoryTree(fullPath, currentDepth + 1, maxDepth);
       } else {
         output += `${indent}📄 ${file} (${stat.size} bytes)\n`;
       }

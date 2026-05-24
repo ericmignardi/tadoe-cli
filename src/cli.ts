@@ -38,13 +38,13 @@ export async function runCli() {
   program.parse(process.argv);
   const options = program.opts();
 
-  const config = loadConfig();
+  const config = await loadConfig();
   if (options.model) config.model = options.model;
   if (options.apiUrl) config.apiUrl = options.apiUrl;
   if (options.safe === false) config.safeMode = false;
 
   if (options.listSessions) {
-    const list = listSessions(config.sessionsDir);
+    const list = await listSessions(config.sessionsDir);
     if (list.length === 0) {
       console.log(chalk.gray('No saved sessions found.'));
     } else {
@@ -71,7 +71,7 @@ export async function runCli() {
     }
 
     const messages: ChatMessage[] = [{ role: 'user', content: promptContent }];
-    const memory = loadMemory(activeConfig.memoryFile);
+    const memory = await loadMemory(activeConfig.memoryFile);
 
     // In non-interactive mode there is no human to confirm prompts. When safe
     // mode is on (default), auto-deny tools that require confirmation. Users

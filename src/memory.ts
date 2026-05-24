@@ -1,21 +1,19 @@
-import fs from 'fs';
+import fs from 'fs/promises';
 import path from 'path';
 import { SECRET_FILE_MODE } from './constants.js';
 
-export function loadMemory(filePath: string): string {
-  if (!fs.existsSync(filePath)) return '';
+export async function loadMemory(filePath: string): Promise<string> {
   try {
-    const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+    const raw = await fs.readFile(filePath, 'utf-8');
+    const data = JSON.parse(raw);
     return data.memory || '';
   } catch {
     return '';
   }
 }
 
-export function saveMemory(filePath: string, memory: string): void {
+export async function saveMemory(filePath: string, memory: string): Promise<void> {
   const dir = path.dirname(filePath);
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
-  }
-  fs.writeFileSync(filePath, JSON.stringify({ memory }, null, 2), { encoding: 'utf-8', mode: SECRET_FILE_MODE });
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(filePath, JSON.stringify({ memory }, null, 2), { encoding: 'utf-8', mode: SECRET_FILE_MODE });
 }
