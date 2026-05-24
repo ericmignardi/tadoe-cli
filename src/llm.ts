@@ -1,18 +1,37 @@
 import { Config } from './config.js';
 import { ChatMessage } from './sessions.js';
-import { executeTool, toolsList } from './tools.js';
-import chalk from 'chalk';
-import ora from 'ora';
+import { executeTool, toolsList, ConfirmHook } from './tools.js';
+import {
+  AGENT_MAX_TURNS,
+  TOOL_CALL_OPEN,
+  TOOL_CALL_CLOSE,
+  TOOL_RESULT_OPEN,
+  TOOL_RESULT_CLOSE,
+} from './constants.js';
 
-/**
- * Builds the base system prompt containing tool documentation and rules.
- */
-function getSystemPrompt(workspaceDir: string, memory?: string): string {
-  const toolsFormatted = toolsList.map(t => {
-    return `- Name: "${t.name}"
-  Description: ${t.description}
-  Parameters schema: ${JSON.stringify(t.parameters)}`;
-  }).join('\n\n');
+export interface AgentHooks {
+  /** Called for each assistant token that is NOT part of a tool call block. */
+  onAssistantChunk?: (chunk: string) => void;
+  /** Called once a tool call is parsed, before execution. */
+  onToolStart?: (name: string, args: any) => void;
+  /** Called with the tool result and success flag. */
+  onToolResult?: (name: string, result: string, success: boolean) => void;
+  /** Called if a tool call cannot be parsed. */
+  onToolParseError?: (raw: string, error: Error) => void;
+  /** Called if the LLM API itself fails. */
+  onApiError?: (error: Error) => void;
+  /** Called before each LLM request (e.g. to start a spinner). */
+  onTurnStart?: (turn: number) => void;
+  /** Called when the first token of a turn arrives (e.g. to stop a spinner). */
+  onFirstToken?: () => void;
+  /** Confirm tool execution; defaults to allow-all. */
+  confirm?: ConfirmHook;
+}
+
+function buildSystemPrompt(workspaceDir: string, memory?: string): string {
+  const toolsFormatted = toolsList.map(t =>
+    `- Name: "${t.name}"\n  Description: ${t.description}\n  Parameters schema: ${JSON.stringify(t.parameters)}`
+  ).join('\n\n');
 
   let prompt = `You are "Tadoe CLI", a powerful and intelligent terminal-based local AI agent.
 You assist developers with programming tasks, repository navigation, file editing, and local shell execution.
@@ -22,22 +41,22 @@ You have access to the following local tools:
 ${toolsFormatted}
 
 To call a tool, you MUST respond with a single tool call formatted exactly like this:
-<tool_call>
+${TOOL_CALL_OPEN}
 {
   "name": "tool_name",
   "arguments": {
     "arg1": "value1"
   }
 }
-</tool_call>
+${TOOL_CALL_CLOSE}
 
 RULES:
 1. ONLY call tools that are listed above.
-2. When calling a tool, you MUST output ONLY the <tool_call> block and nothing else. Do not output conversational text before or after the tool call.
+2. When calling a tool, you MUST output ONLY the tool_call block and nothing else. Do not output conversational text before or after the tool call.
 3. The environment will execute the tool and provide the results in the next turn as:
-<tool_result>
+${TOOL_RESULT_OPEN}
 [result content]
-</tool_result>
+${TOOL_RESULT_CLOSE}
 4. You can use multiple tools sequentially to complete a complex task.
 5. Once you have completed all tasks or if you do not need tools, answer the user directly in standard markdown format.
 6. Be concise and precise. Avoid excessive explanations.`;
@@ -45,23 +64,23 @@ RULES:
   if (memory && memory.trim()) {
     prompt += `\n\n### User Memory (Persistent Context):\n${memory}`;
   }
-
   return prompt;
 }
 
-/**
- * Streams chat completions from the OpenAI-compatible API.
- */
+interface StreamChunk {
+  choices: { delta?: { content?: string } }[];
+}
+
 export async function streamChatCompletion(
   config: Config,
   messages: ChatMessage[],
-  onChunk: (chunk: string) => void
+  onChunk: (chunk: string) => void,
 ): Promise<string> {
   const response = await fetch(`${config.apiUrl.replace(/\/$/, '')}/chat/completions`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'Authorization': `Bearer ${config.apiKey}`,
+      Authorization: `Bearer ${config.apiKey}`,
     },
     body: JSON.stringify({
       model: config.model,
@@ -72,10 +91,8 @@ export async function streamChatCompletion(
   });
 
   if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`LLM API returned status ${response.status}: ${errorText}`);
+    throw new Error(`LLM API returned status ${response.status}: ${await response.text()}`);
   }
-
   if (!response.body) {
     throw new Error('LLM API returned empty response body.');
   }
@@ -88,27 +105,25 @@ export async function streamChatCompletion(
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
-    
+
     buffer += decoder.decode(value, { stream: true });
     const lines = buffer.split('\n');
     buffer = lines.pop() || '';
 
     for (const line of lines) {
       const trimmed = line.trim();
-      if (!trimmed) continue;
-      if (trimmed === 'data: [DONE]') continue;
-      if (trimmed.startsWith('data: ')) {
-        try {
-          const json = JSON.parse(trimmed.slice(6));
-          const choice = json.choices[0];
-          const content = choice.delta?.content || '';
-          if (content) {
-            fullContent += content;
-            onChunk(content);
-          }
-        } catch (e) {
-          // Ignore parse errors for split chunks
+      if (!trimmed || trimmed === 'data: [DONE]') continue;
+      if (!trimmed.startsWith('data: ')) continue;
+
+      try {
+        const json = JSON.parse(trimmed.slice(6)) as StreamChunk;
+        const content = json.choices[0]?.delta?.content || '';
+        if (content) {
+          fullContent += content;
+          onChunk(content);
         }
+      } catch {
+        // tolerate split chunks
       }
     }
   }
@@ -117,55 +132,48 @@ export async function streamChatCompletion(
 }
 
 /**
- * Displays a tool action in Claude CLI compact style.
+ * Stateful filter: forwards streamed assistant text to `emit` while suppressing
+ * any text from `<tool_call>` onward (including a partial tag at the buffer tail).
  */
-function displayToolAction(name: string, args: any): void {
-  const border = chalk.dim('─'.repeat(40));
-  console.log('');
-  console.log(chalk.dim(`  ┌${border}┐`));
+function createToolCallFilter(emit: (text: string) => void) {
+  let buffer = '';
+  let printedTo = 0;
+  let suppressing = false;
 
-  // Tool name with icon
-  let icon = '🔧';
-  let label = name;
-  if (name === 'read_file') { icon = '📄'; label = `Read ${args.path || 'file'}`; }
-  else if (name === 'write_file') { icon = '✏️'; label = `Write ${args.path || 'file'}`; }
-  else if (name === 'list_dir') { icon = '📁'; label = `List ${args.path || '.'}`; }
-  else if (name === 'run_command') { icon = '⚡'; label = `Run \`${args.command || ''}\``; }
+  return (chunk: string) => {
+    buffer += chunk;
+    if (suppressing) return;
 
-  console.log(chalk.dim(`  │ `) + `${icon} ${chalk.bold.cyan(label)}` + chalk.dim(` │`));
-  console.log(chalk.dim(`  └${border}┘`));
+    const idx = buffer.indexOf(TOOL_CALL_OPEN);
+    if (idx !== -1) {
+      if (idx > printedTo) emit(buffer.slice(printedTo, idx));
+      printedTo = idx;
+      suppressing = true;
+      return;
+    }
+
+    // Hold back any partial prefix of TOOL_CALL_OPEN at the end of the buffer.
+    let safeEnd = buffer.length;
+    for (let i = TOOL_CALL_OPEN.length - 1; i > 0; i--) {
+      if (buffer.endsWith(TOOL_CALL_OPEN.slice(0, i))) {
+        safeEnd = buffer.length - i;
+        break;
+      }
+    }
+    if (safeEnd > printedTo) {
+      emit(buffer.slice(printedTo, safeEnd));
+      printedTo = safeEnd;
+    }
+  };
 }
 
-/**
- * Displays a tool result in Claude CLI compact style.
- */
-function displayToolResult(result: string, success: boolean): void {
-  const maxPreview = 120;
-  const preview = result.length > maxPreview
-    ? result.slice(0, maxPreview).replace(/\n/g, ' ') + '…'
-    : result.replace(/\n/g, ' ');
-
-  if (success) {
-    console.log(chalk.dim(`  ✓ `) + chalk.dim(preview));
-  } else {
-    console.log(chalk.red(`  ✗ `) + chalk.dim(preview));
-  }
-}
-
-/**
- * Runs the agentic ReAct loop.
- * Continues calling the LLM and executing tools until a final conversational response is reached.
- */
 export async function runAgentLoop(
   config: Config,
   messages: ChatMessage[],
   memory: string,
-  onUserOutput: (text: string) => void
+  hooks: AgentHooks,
 ): Promise<ChatMessage[]> {
-  const workspaceDir = process.cwd();
-  const systemPrompt = getSystemPrompt(workspaceDir, memory);
-
-  // Set or update system message at index 0
+  const systemPrompt = buildSystemPrompt(process.cwd(), memory);
   const activeMessages = [...messages];
   const systemMsgIndex = activeMessages.findIndex(m => m.role === 'system');
   if (systemMsgIndex !== -1) {
@@ -174,123 +182,55 @@ export async function runAgentLoop(
     activeMessages.unshift({ role: 'system', content: systemPrompt });
   }
 
-  const MAX_TURNS = 10;
-  let turn = 0;
+  for (let turn = 1; turn <= AGENT_MAX_TURNS; turn++) {
+    hooks.onTurnStart?.(turn);
 
-  while (turn < MAX_TURNS) {
-    turn++;
     let fullResponse = '';
-    let lastPrintedIndex = 0;
-    let insideToolCall = false;
-
-    // Helper to print streamed chunks without leaking the <tool_call> tags
-    const handleChunk = (chunk: string) => {
-      fullResponse += chunk;
-      
-      const toolCallIndex = fullResponse.indexOf('<tool_call>');
-      if (toolCallIndex === -1) {
-        // Look for partial prefix of "<tool_call>" at the end of the text
-        let cutIndex = fullResponse.length;
-        const tag = '<tool_call>';
-        for (let i = tag.length - 1; i > 0; i--) {
-          const sub = tag.slice(0, i);
-          if (fullResponse.endsWith(sub)) {
-            cutIndex = fullResponse.length - i;
-            break;
-          }
-        }
-        
-        if (cutIndex > lastPrintedIndex) {
-          const toPrint = fullResponse.slice(lastPrintedIndex, cutIndex);
-          onUserOutput(toPrint);
-          lastPrintedIndex += toPrint.length;
-        }
-      } else {
-        // Tool call detected — suppress all further output
-        if (!insideToolCall) {
-          // Print everything before the tag
-          if (toolCallIndex > lastPrintedIndex) {
-            const toPrint = fullResponse.slice(lastPrintedIndex, toolCallIndex);
-            onUserOutput(toPrint);
-            lastPrintedIndex += toPrint.length;
-          }
-          insideToolCall = true;
-        }
-      }
-    };
-
-    // Spin up thinking indicator (Claude CLI style: dim text)
-    const spinner = ora({
-      text: chalk.dim('Thinking…'),
-      color: 'magenta',
-      spinner: 'dots',
-    }).start();
+    let firstTokenSeen = false;
+    const filter = createToolCallFilter(text => hooks.onAssistantChunk?.(text));
 
     try {
-      await streamChatCompletion(config, activeMessages, (chunk) => {
-        if (spinner.isSpinning) {
-          spinner.stop();
+      await streamChatCompletion(config, activeMessages, chunk => {
+        if (!firstTokenSeen) {
+          firstTokenSeen = true;
+          hooks.onFirstToken?.();
         }
-        handleChunk(chunk);
+        fullResponse += chunk;
+        filter(chunk);
       });
-      if (spinner.isSpinning) {
-        spinner.stop();
-      }
     } catch (err) {
-      if (spinner.isSpinning) {
-        spinner.stop();
-      }
-      console.log(chalk.red(`\n  ❌ Error communicating with LLM API: ${(err as Error).message}`));
-      console.log('');
-      console.log(chalk.yellow(`  Troubleshooting:`));
-      console.log(chalk.dim(`  1. Make sure LM Studio is running.`));
-      console.log(chalk.dim(`  2. Open the Local Server tab in LM Studio.`));
-      console.log(chalk.dim(`  3. Load a model and click "Start Server".`));
-      console.log(chalk.dim(`  4. Verify the server port is 1234.`));
-      console.log('');
+      hooks.onApiError?.(err as Error);
       break;
     }
 
-    // Append assistant's answer
     activeMessages.push({ role: 'assistant', content: fullResponse });
 
-    // Detect if there is a tool call
     const toolCallMatch = fullResponse.match(/<tool_call>([\s\S]*?)<\/tool_call>/);
-    if (!toolCallMatch) {
-      // No tool calls, loop ends. This is the final message.
-      break;
-    }
+    if (!toolCallMatch) break;
 
-    // Extract tool call
     const jsonStr = toolCallMatch[1].trim();
     let toolCall: { name: string; arguments: any };
-
     try {
       toolCall = JSON.parse(jsonStr);
     } catch (e) {
-      console.log(chalk.red(`\n  ⚠ Failed to parse tool call: ${(e as Error).message}`));
+      hooks.onToolParseError?.(jsonStr, e as Error);
       activeMessages.push({
         role: 'user',
-        content: `<tool_result>\nError: Failed to parse tool call JSON. Please use the exact schema and correct syntax.\n</tool_result>`,
+        content: `${TOOL_RESULT_OPEN}\nError: Failed to parse tool call JSON. Please use the exact schema and correct syntax.\n${TOOL_RESULT_CLOSE}`,
       });
       continue;
     }
 
-    // Display tool action in compact Claude CLI style
-    displayToolAction(toolCall.name, toolCall.arguments);
+    hooks.onToolStart?.(toolCall.name, toolCall.arguments);
+    const toolResult = await executeTool(toolCall.name, toolCall.arguments, hooks.confirm);
+    const success = !toolResult.startsWith('Error');
+    hooks.onToolResult?.(toolCall.name, toolResult, success);
 
-    // Execute tool
-    const toolResult = await executeTool(toolCall.name, toolCall.arguments, config.safeMode);
-    const isError = toolResult.startsWith('Error');
-    displayToolResult(toolResult, !isError);
-
-    // Feed result back
     activeMessages.push({
       role: 'user',
-      content: `<tool_result>\n${toolResult}\n</tool_result>`,
+      content: `${TOOL_RESULT_OPEN}\n${toolResult}\n${TOOL_RESULT_CLOSE}`,
     });
   }
 
-  // Return the full updated message history (including assistant answers and tool results)
   return activeMessages;
 }

@@ -3,9 +3,6 @@ import path from 'path';
 import os from 'os';
 import dotenv from 'dotenv';
 
-// Load local .env if it exists
-dotenv.config();
-
 export interface Config {
   apiUrl: string;
   apiKey: string;
@@ -28,8 +25,15 @@ const DEFAULTS: Config = {
   configFile: path.join(TADOE_DIR, 'config.json'),
 };
 
+// localhost resolves to ::1 on Windows by default, which the LM Studio server
+// does not listen on. Pin to IPv4 instead.
+function preferIPv4(url: string): string {
+  return url.replace(/\/\/localhost([:/])/i, '//127.0.0.1$1');
+}
+
 export function loadConfig(): Config {
-  // Ensure .tadoe base directory exists
+  dotenv.config();
+
   if (!fs.existsSync(TADOE_DIR)) {
     fs.mkdirSync(TADOE_DIR, { recursive: true });
   }
@@ -37,21 +41,16 @@ export function loadConfig(): Config {
   let fileConfig: Partial<Config> = {};
   if (fs.existsSync(DEFAULTS.configFile)) {
     try {
-      const data = fs.readFileSync(DEFAULTS.configFile, 'utf-8');
-      fileConfig = JSON.parse(data);
-    } catch (e) {
-      console.warn(`[Config] Warning: Failed to parse config file at ${DEFAULTS.configFile}. Using defaults.`);
+      fileConfig = JSON.parse(fs.readFileSync(DEFAULTS.configFile, 'utf-8'));
+    } catch {
+      console.warn(`[Config] Failed to parse ${DEFAULTS.configFile}. Using defaults.`);
     }
   }
 
-  // Load from environment or fall back to fileConfig / DEFAULTS
-  let apiUrl = process.env.TADOE_API_URL || fileConfig.apiUrl || DEFAULTS.apiUrl;
-  if (apiUrl.includes('localhost:1234')) {
-    apiUrl = apiUrl.replace('localhost:1234', '127.0.0.1:1234');
-  }
+  const apiUrl = preferIPv4(process.env.TADOE_API_URL || fileConfig.apiUrl || DEFAULTS.apiUrl);
   const apiKey = process.env.TADOE_API_KEY || fileConfig.apiKey || DEFAULTS.apiKey;
   const model = process.env.TADOE_MODEL || fileConfig.model || DEFAULTS.model;
-  
+
   let safeMode = DEFAULTS.safeMode;
   if (process.env.TADOE_SAFE_MODE !== undefined) {
     safeMode = process.env.TADOE_SAFE_MODE === 'true';
@@ -62,7 +61,6 @@ export function loadConfig(): Config {
   const sessionsDir = process.env.TADOE_SESSIONS_DIR || fileConfig.sessionsDir || DEFAULTS.sessionsDir;
   const memoryFile = process.env.TADOE_MEMORY_FILE || fileConfig.memoryFile || DEFAULTS.memoryFile;
 
-  // Create session directory
   if (!fs.existsSync(sessionsDir)) {
     fs.mkdirSync(sessionsDir, { recursive: true });
   }
@@ -79,32 +77,28 @@ export function loadConfig(): Config {
 }
 
 export async function detectActiveModel(config: Config): Promise<string> {
-  if (config.model !== 'auto') {
-    return config.model;
-  }
+  if (config.model !== 'auto') return config.model;
 
   try {
     const url = `${config.apiUrl.replace(/\/$/, '')}/models`;
     const response = await fetch(url, {
       method: 'GET',
       headers: {
-        'Authorization': `Bearer ${config.apiKey}`,
+        Authorization: `Bearer ${config.apiKey}`,
         'Content-Type': 'application/json',
       },
     });
 
     if (response.ok) {
-      const data = (await response.json()) as any;
-      if (data && data.data && data.data.length > 0) {
-        // Return first loaded model name
+      const data = (await response.json()) as { data?: { id: string }[] };
+      if (data?.data && data.data.length > 0) {
         return data.data[0].id;
       }
     }
-  } catch (err) {
-    // If server is not active or call fails, don't fail immediately, just print warning
+  } catch {
+    // server unreachable — fall through to placeholder
   }
 
-  // Fallback if autodetection fails
   return 'local-model';
 }
 

@@ -1,8 +1,7 @@
 import fs from 'fs';
 import path from 'path';
-import { exec } from 'child_process';
-import prompts from 'prompts';
-import chalk from 'chalk';
+import { FILE_READ_LIMIT_BYTES, SKIP_DIR_NAMES } from './constants.js';
+import { runShell, formatShellResult } from './shell.js';
 
 export interface ToolParameter {
   type: string;
@@ -18,6 +17,12 @@ export interface ToolDefinition {
   execute: (args: any) => Promise<string>;
 }
 
+/**
+ * Caller-supplied confirmation hook. Return true to allow the tool call.
+ * If not provided (or returns true), execution proceeds without prompting.
+ */
+export type ConfirmHook = (name: string, args: any) => Promise<boolean>;
+
 export const toolsList: ToolDefinition[] = [
   {
     name: 'read_file',
@@ -25,10 +30,7 @@ export const toolsList: ToolDefinition[] = [
     parameters: {
       type: 'object',
       properties: {
-        path: {
-          type: 'string',
-          description: 'The path of the file to read',
-        },
+        path: { type: 'string', description: 'The path of the file to read' },
       },
       required: ['path'],
     },
@@ -42,11 +44,9 @@ export const toolsList: ToolDefinition[] = [
       if (!stat.isFile()) {
         return `Error: Path ${resolvedPath} is a directory, not a file.`;
       }
-      // Read a maximum of 100KB to prevent context blowup
-      const LIMIT = 100 * 1024;
-      if (stat.size > LIMIT) {
-        const stream = fs.readFileSync(resolvedPath, 'utf-8');
-        return stream.slice(0, LIMIT) + '\n\n... [File content truncated to first 100KB]';
+      if (stat.size > FILE_READ_LIMIT_BYTES) {
+        const content = fs.readFileSync(resolvedPath, 'utf-8');
+        return content.slice(0, FILE_READ_LIMIT_BYTES) + '\n\n... [File content truncated]';
       }
       return fs.readFileSync(resolvedPath, 'utf-8');
     },
@@ -57,14 +57,8 @@ export const toolsList: ToolDefinition[] = [
     parameters: {
       type: 'object',
       properties: {
-        path: {
-          type: 'string',
-          description: 'The path where the file should be written',
-        },
-        content: {
-          type: 'string',
-          description: 'The complete text content to write to the file',
-        },
+        path: { type: 'string', description: 'The path where the file should be written' },
+        content: { type: 'string', description: 'The complete text content to write to the file' },
       },
       required: ['path', 'content'],
     },
@@ -105,24 +99,18 @@ export const toolsList: ToolDefinition[] = [
       }
 
       const files = fs.readdirSync(resolvedPath);
-      if (files.length === 0) {
-        return `Directory is empty.`;
-      }
+      if (files.length === 0) return 'Directory is empty.';
 
       let output = `Contents of directory "${targetDir}":\n`;
       for (const file of files) {
-        if (file === 'node_modules' || file === '.git' || file === 'dist') {
-          continue;
-        }
+        if (SKIP_DIR_NAMES.has(file)) continue;
         const fullPath = path.join(resolvedPath, file);
         try {
           const fstat = fs.statSync(fullPath);
-          if (fstat.isDirectory()) {
-            output += `📁 ${file}/\n`;
-          } else {
-            output += `📄 ${file} (${fstat.size} bytes)\n`;
-          }
-        } catch (e) {
+          output += fstat.isDirectory()
+            ? `📁 ${file}/\n`
+            : `📄 ${file} (${fstat.size} bytes)\n`;
+        } catch {
           output += `📄 ${file} (Error reading details)\n`;
         }
       }
@@ -135,68 +123,33 @@ export const toolsList: ToolDefinition[] = [
     parameters: {
       type: 'object',
       properties: {
-        command: {
-          type: 'string',
-          description: 'The command to execute in the terminal',
-        },
+        command: { type: 'string', description: 'The command to execute in the terminal' },
       },
       required: ['command'],
     },
     requiresConfirmation: true,
     execute: async (args: { command: string }) => {
-      return new Promise<string>((resolve) => {
-        // Set a timeout of 60 seconds
-        const child = exec(args.command, { timeout: 60000 }, (error, stdout, stderr) => {
-          let output = '';
-          if (stdout) {
-            output += stdout;
-          }
-          if (stderr) {
-            output += `\n[STDERR]\n${stderr}`;
-          }
-          if (error) {
-            output += `\n[EXECUTION ERROR] ${error.message}`;
-          }
-          if (!output.trim()) {
-            output = `Command executed successfully but returned no output.`;
-          }
-          resolve(output);
-        });
-      });
+      const result = await runShell(args.command);
+      return formatShellResult(result);
     },
   },
 ];
 
 /**
- * Execute a tool by name, optionally prompting user for confirmation if safeMode is enabled.
+ * Execute a tool by name. If the tool requires confirmation, the optional
+ * `confirm` hook is consulted; if it resolves false, execution is denied.
  */
-export async function executeTool(name: string, args: any, safeMode: boolean): Promise<string> {
+export async function executeTool(
+  name: string,
+  args: any,
+  confirm?: ConfirmHook,
+): Promise<string> {
   const tool = toolsList.find(t => t.name === name);
-  if (!tool) {
-    return `Error: Tool "${name}" is not implemented.`;
-  }
+  if (!tool) return `Error: Tool "${name}" is not implemented.`;
 
-  if (safeMode && tool.requiresConfirmation) {
-    console.log(chalk.yellow(`\n⚠️  [Tadoe Safe Mode] Action authorization requested.`));
-    if (name === 'write_file') {
-      console.log(chalk.yellow(`   Action: Write/Overwrite file: ${args.path}`));
-      console.log(chalk.gray(`   Content preview (first 150 chars):\n${String(args.content).slice(0, 150)}...`));
-    } else if (name === 'run_command') {
-      console.log(chalk.yellow(`   Action: Run command: ${args.command}`));
-    }
-
-    const response = await prompts({
-      type: 'confirm',
-      name: 'approve',
-      message: 'Do you authorize this action?',
-      initial: false,
-    });
-
-    if (!response.approve) {
-      console.log(chalk.red(`🚫 Action denied by user.\n`));
-      return `Error: User denied permission to execute the tool "${name}".`;
-    }
-    console.log(chalk.green(`✔️  Action approved. Executing...\n`));
+  if (tool.requiresConfirmation && confirm) {
+    const ok = await confirm(name, args);
+    if (!ok) return `Error: User denied permission to execute the tool "${name}".`;
   }
 
   try {
