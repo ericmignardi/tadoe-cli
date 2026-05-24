@@ -106,6 +106,14 @@ export async function startInteractiveSession(config: Config, initialSessionId?:
     const input = response.input.trim();
     if (!input) continue;
 
+    // Check for exit/quit without slash
+    const lowerInput = input.toLowerCase();
+    if (lowerInput === 'exit' || lowerInput === 'quit') {
+      console.log(chalk.yellow('👋 Saving session and exiting. Goodbye!'));
+      saveSession(activeConfig.sessionsDir, sessionId, messages);
+      break;
+    }
+
     // Parse the input
     const parsed = await parseInput(input);
 

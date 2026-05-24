@@ -196,6 +196,13 @@ export async function runAgentLoop(
         spinner.stop();
       }
       console.log(chalk.red(`\n❌ Error communicating with LLM API: ${(err as Error).message}`));
+      console.log(chalk.yellow(`\n🔍 Troubleshooting steps for LM Studio connection:`));
+      console.log(chalk.gray(`   1. Make sure LM Studio is running.`));
+      console.log(chalk.gray(`   2. In LM Studio, click the <Local Server> tab (double-headed arrow icon on the left sidebar).`));
+      console.log(chalk.gray(`   3. Select a model to load from the dropdown at the top of that tab.`));
+      console.log(chalk.gray(`   4. Click the green "Start Server" button. Ensure the status turns to "Stop Server" (meaning it is active).`));
+      console.log(chalk.gray(`   5. Verify that the Server Port in LM Studio is set to 1234. If it's different, set TADOE_API_URL accordingly.`));
+      console.log();
       break;
     }
 
