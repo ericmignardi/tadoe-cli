@@ -1,7 +1,7 @@
-import prompts from 'prompts';
 import chalk from 'chalk';
 import fs from 'fs';
 import path from 'path';
+import readline from 'readline';
 import { exec } from 'child_process';
 import { marked } from 'marked';
 import { markedTerminal } from 'marked-terminal';
@@ -13,8 +13,12 @@ import { ChatMessage, saveSession, loadSession, listSessions, deleteSession } fr
 import { runAgentLoop } from './llm.js';
 import { toolsList } from './tools.js';
 
-// Register markdown terminal renderer
-marked.use(markedTerminal() as any);
+// Register markdown terminal renderer with Claude-like styling
+marked.use(markedTerminal({
+  reflowText: true,
+  width: Math.min(process.stdout.columns || 80, 100),
+  tab: 2,
+} as any) as any);
 
 export function loadMemory(filePath: string): string {
   if (!fs.existsSync(filePath)) return '';
@@ -38,7 +42,7 @@ export function saveMemory(filePath: string, memory: string): void {
  * Runs a shell escape command synchronously (awaited).
  */
 async function runShellEscape(command: string): Promise<void> {
-  console.log(chalk.yellow(`⚙️  Running shell command: "${command}"\n`));
+  console.log(chalk.dim(`  $ ${command}\n`));
   return new Promise((resolve) => {
     exec(command, (err, stdout, stderr) => {
       if (stdout) {
@@ -48,7 +52,7 @@ async function runShellEscape(command: string): Promise<void> {
         process.stderr.write(chalk.red(stderr));
       }
       if (err) {
-        console.log(chalk.red(`\n❌ Command failed with exit code: ${(err as any).code}`));
+        console.log(chalk.red(`  Exit code: ${(err as any).code}`));
       }
       console.log();
       resolve();
@@ -57,17 +61,50 @@ async function runShellEscape(command: string): Promise<void> {
 }
 
 /**
- * Interactive REPL terminal session.
+ * Renders markdown text with a left-border like Claude CLI.
+ */
+function renderAssistantBlock(text: string): string {
+  const border = chalk.magenta('│');
+  try {
+    const rendered = marked.parse(text) as string;
+    const lines = rendered.split('\n');
+    return lines.map(line => `  ${border} ${line}`).join('\n');
+  } catch {
+    const lines = text.split('\n');
+    return lines.map(line => `  ${border} ${line}`).join('\n');
+  }
+}
+
+/**
+ * Prompt the user for input using readline (matches Claude CLI's clean `>` prompt).
+ */
+function promptUser(rl: readline.Interface): Promise<string | null> {
+  return new Promise((resolve) => {
+    rl.question(chalk.bold.magenta('\n> '), (answer) => {
+      resolve(answer);
+    });
+
+    // Handle Ctrl+C gracefully
+    rl.once('close', () => {
+      resolve(null);
+    });
+  });
+}
+
+/**
+ * Interactive REPL terminal session styled like Claude CLI.
  */
 export async function startInteractiveSession(config: Config, initialSessionId?: string) {
   printAsciiLogo();
 
   // Detect active model name
   const activeModel = await detectActiveModel(config);
-  console.log(chalk.green(`🟢 Connected to LM Studio API: ${chalk.bold(config.apiUrl)}`));
-  console.log(chalk.green(`🤖 Loaded Model: ${chalk.bold(activeModel)}`));
-  console.log(chalk.gray(`💡 Type ${chalk.yellow('/help')} to see available commands or ${chalk.yellow('@filename')} to include context.`));
-  console.log(chalk.gray(`💡 Type ${chalk.yellow('!command')} to run a shell command directly.\n`));
+
+  // Compact status line (like Claude CLI's model info bar)
+  const modelDisplay = chalk.bold.white(activeModel);
+  const apiDisplay = chalk.dim(config.apiUrl);
+  console.log(chalk.dim(`  Model: `) + modelDisplay + chalk.dim(`  •  `) + apiDisplay);
+  console.log(chalk.dim(`  Safe mode: ${config.safeMode ? chalk.green('on') : chalk.red('off')}  •  /help for commands  •  /quit to exit\n`));
 
   // Merge the detected model back into the config so llm.ts uses it
   const activeConfig = { ...config, model: activeModel };
@@ -78,9 +115,9 @@ export async function startInteractiveSession(config: Config, initialSessionId?:
   if (initialSessionId) {
     try {
       messages = loadSession(activeConfig.sessionsDir, initialSessionId);
-      console.log(chalk.cyan(`🔄 Resumed chat session: ${chalk.bold(initialSessionId)} (${messages.length} messages loaded)\n`));
+      console.log(chalk.dim(`  Resumed session: ${initialSessionId} (${messages.length} messages)\n`));
     } catch (e) {
-      console.log(chalk.red(`❌ Failed to resume session: ${(e as Error).message}. Starting new session.`));
+      console.log(chalk.red(`  Failed to resume: ${(e as Error).message}\n`));
       sessionId = `session_${Date.now()}`;
     }
   }
@@ -88,29 +125,33 @@ export async function startInteractiveSession(config: Config, initialSessionId?:
   // Load persistent memory
   let memory = loadMemory(activeConfig.memoryFile);
 
-  while (true) {
-    // Prompt the user for input
-    const response = await prompts({
-      type: 'text',
-      name: 'input',
-      message: chalk.magenta('Tadoe >'),
-    });
+  // Set up readline for native terminal input
+  const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout,
+    terminal: true,
+  });
 
-    // If Ctrl+C or empty exit
-    if (response.input === undefined) {
-      console.log(chalk.yellow('\n👋 Saving session and exiting. Goodbye!'));
+  while (true) {
+    const rawInput = await promptUser(rl);
+
+    // If Ctrl+C or stream closed
+    if (rawInput === null) {
+      console.log(chalk.dim('\n  Saving session and exiting. Goodbye!\n'));
       saveSession(activeConfig.sessionsDir, sessionId, messages);
+      rl.close();
       break;
     }
 
-    const input = response.input.trim();
+    const input = rawInput.trim();
     if (!input) continue;
 
-    // Check for exit/quit without slash
+    // Check for exit/quit (with or without slash)
     const lowerInput = input.toLowerCase();
     if (lowerInput === 'exit' || lowerInput === 'quit') {
-      console.log(chalk.yellow('👋 Saving session and exiting. Goodbye!'));
+      console.log(chalk.dim('\n  Saving session and exiting. Goodbye!\n'));
       saveSession(activeConfig.sessionsDir, sessionId, messages);
+      rl.close();
       break;
     }
 
@@ -118,19 +159,18 @@ export async function startInteractiveSession(config: Config, initialSessionId?:
     const parsed = await parseInput(input);
 
     if (parsed.type === 'shell') {
-      // Direct shell escape e.g. !git status
       await runShellEscape(parsed.content);
       continue;
     }
 
     if (parsed.type === 'slash') {
-      // Process Slash commands
       const cmd = parsed.commandName;
       const args = parsed.args || [];
 
       if (cmd === 'exit' || cmd === 'quit') {
-        console.log(chalk.yellow('👋 Saving session and exiting. Goodbye!'));
+        console.log(chalk.dim('\n  Saving session and exiting. Goodbye!\n'));
         saveSession(activeConfig.sessionsDir, sessionId, messages);
+        rl.close();
         break;
       }
 
@@ -140,28 +180,40 @@ export async function startInteractiveSession(config: Config, initialSessionId?:
       }
 
       if (cmd === 'help') {
-        console.log(chalk.cyan(`\n📚 ${chalk.bold('Tadoe CLI Commands:')}`));
-        console.log(`  ${chalk.yellow('/help')}                   Show this help menu`);
-        console.log(`  ${chalk.yellow('/clear')}                  Clear the console screen`);
-        console.log(`  ${chalk.yellow('/tools')}                  List all available agentic tools`);
-        console.log(`  ${chalk.yellow('/exit')} or ${chalk.yellow('/quit')}        Exit the interactive session`);
-        console.log(`  ${chalk.yellow('/chat list')}             List all saved chat sessions`);
-        console.log(`  ${chalk.yellow('/chat resume <name>')}    Resume a saved chat session`);
-        console.log(`  ${chalk.yellow('/chat save <name>')}      Save current session as <name>`);
-        console.log(`  ${chalk.yellow('/chat delete <name>')}    Delete a saved session`);
-        console.log(`  ${chalk.yellow('/memory list')}           Show current persistent memories`);
-        console.log(`  ${chalk.yellow('/memory add <text>')}     Add instructions to persistent memory`);
-        console.log(`  ${chalk.yellow('/memory clear')}          Clear all persistent memory`);
-        console.log();
+        console.log('');
+        console.log(chalk.bold('  Commands:'));
+        console.log(chalk.dim('  ─────────────────────────────────────────'));
+        console.log(`  ${chalk.yellow('/help')}                   Show this menu`);
+        console.log(`  ${chalk.yellow('/clear')}                  Clear screen`);
+        console.log(`  ${chalk.yellow('/tools')}                  List agent tools`);
+        console.log(`  ${chalk.yellow('/quit')}                   Exit session`);
+        console.log(`  ${chalk.yellow('/chat list')}              List saved sessions`);
+        console.log(`  ${chalk.yellow('/chat save <name>')}       Save session`);
+        console.log(`  ${chalk.yellow('/chat resume <name>')}     Resume session`);
+        console.log(`  ${chalk.yellow('/chat delete <name>')}     Delete session`);
+        console.log(`  ${chalk.yellow('/memory list')}            Show memories`);
+        console.log(`  ${chalk.yellow('/memory add <text>')}      Add to memory`);
+        console.log(`  ${chalk.yellow('/memory clear')}           Clear memory`);
+        console.log('');
+        console.log(chalk.bold('  Input Shortcuts:'));
+        console.log(chalk.dim('  ─────────────────────────────────────────'));
+        console.log(`  ${chalk.yellow('@file.ts')}                Inject file contents`);
+        console.log(`  ${chalk.yellow('@src/')}                   Inject directory tree`);
+        console.log(`  ${chalk.yellow('!git status')}             Run shell command`);
+        console.log('');
         continue;
       }
 
       if (cmd === 'tools') {
-        console.log(chalk.cyan(`\n🛠️  ${chalk.bold('Available Agent Tools:')}`));
+        console.log('');
+        console.log(chalk.bold('  Available Tools:'));
+        console.log(chalk.dim('  ─────────────────────────────────────────'));
         toolsList.forEach(t => {
-          console.log(`  - ${chalk.yellow(t.name)}: ${t.description}`);
+          const confirmTag = t.requiresConfirmation ? chalk.yellow(' (requires approval)') : '';
+          console.log(`  ${chalk.cyan(t.name)}${confirmTag}`);
+          console.log(chalk.dim(`    ${t.description}`));
         });
-        console.log();
+        console.log('');
         continue;
       }
 
@@ -172,43 +224,44 @@ export async function startInteractiveSession(config: Config, initialSessionId?:
         if (sub === 'list') {
           const list = listSessions(activeConfig.sessionsDir);
           if (list.length === 0) {
-            console.log(chalk.gray('No saved sessions found.'));
+            console.log(chalk.dim('\n  No saved sessions.\n'));
           } else {
-            console.log(chalk.cyan(`\n📂 Saved Sessions:`));
+            console.log('');
+            console.log(chalk.bold('  Saved Sessions:'));
             list.forEach(s => {
-              console.log(`  - ${chalk.yellow(s.id)} (${s.messageCount} messages, last active: ${s.lastUpdated})`);
+              console.log(chalk.dim(`  • ${chalk.white(s.id)} — ${s.messageCount} messages — ${s.lastUpdated}`));
             });
-            console.log();
+            console.log('');
           }
         } else if (sub === 'save') {
           if (!tag) {
-            console.log(chalk.red('❌ Please provide a session tag. E.g. `/chat save feature_branch`'));
+            console.log(chalk.red('  Usage: /chat save <name>'));
           } else {
             sessionId = tag;
             saveSession(activeConfig.sessionsDir, sessionId, messages);
-            console.log(chalk.green(`✔️  Session saved as: ${chalk.bold(sessionId)}\n`));
+            console.log(chalk.green(`  ✓ Session saved: ${sessionId}\n`));
           }
         } else if (sub === 'resume') {
           if (!tag) {
-            console.log(chalk.red('❌ Please provide a session tag. E.g. `/chat resume feature_branch`'));
+            console.log(chalk.red('  Usage: /chat resume <name>'));
           } else {
             try {
               messages = loadSession(activeConfig.sessionsDir, tag);
               sessionId = tag;
-              console.log(chalk.green(`🔄 Resumed chat session: ${chalk.bold(sessionId)} (${messages.length} messages loaded)\n`));
+              console.log(chalk.green(`  ✓ Resumed: ${sessionId} (${messages.length} messages)\n`));
             } catch (e) {
-              console.log(chalk.red(`❌ ${(e as Error).message}`));
+              console.log(chalk.red(`  ${(e as Error).message}`));
             }
           }
         } else if (sub === 'delete') {
           if (!tag) {
-            console.log(chalk.red('❌ Please provide a session tag. E.g. `/chat delete old_chat`'));
+            console.log(chalk.red('  Usage: /chat delete <name>'));
           } else {
             deleteSession(activeConfig.sessionsDir, tag);
-            console.log(chalk.green(`✔️  Session ${chalk.bold(tag)} deleted.`));
+            console.log(chalk.green(`  ✓ Deleted: ${tag}`));
           }
         } else {
-          console.log(chalk.red('❌ Invalid `/chat` command. Use: `/chat [list|save|resume|delete]`'));
+          console.log(chalk.red('  Usage: /chat [list|save|resume|delete]'));
         }
         continue;
       }
@@ -219,31 +272,34 @@ export async function startInteractiveSession(config: Config, initialSessionId?:
 
         if (sub === 'list') {
           if (!memory.trim()) {
-            console.log(chalk.gray('Memory is currently empty.'));
+            console.log(chalk.dim('\n  No memories stored.\n'));
           } else {
-            console.log(chalk.cyan(`\n🧠 Persistent Memory:\n`));
-            console.log(chalk.italic(memory));
-            console.log();
+            console.log('');
+            console.log(chalk.bold('  Memories:'));
+            memory.split('\n').forEach(line => {
+              console.log(chalk.dim(`  • ${line}`));
+            });
+            console.log('');
           }
         } else if (sub === 'add') {
           if (!text) {
-            console.log(chalk.red('❌ Please specify text to add to memory. E.g. `/memory add prefer ESM imports`'));
+            console.log(chalk.red('  Usage: /memory add <text>'));
           } else {
             memory = memory ? `${memory}\n${text}` : text;
             saveMemory(activeConfig.configFile.replace('config.json', 'memory.json'), memory);
-            console.log(chalk.green(`🧠 Memory updated.`));
+            console.log(chalk.green('  ✓ Memory updated.'));
           }
         } else if (sub === 'clear') {
           memory = '';
           saveMemory(activeConfig.configFile.replace('config.json', 'memory.json'), memory);
-          console.log(chalk.green('🧠 Memory cleared.'));
+          console.log(chalk.green('  ✓ Memory cleared.'));
         } else {
-          console.log(chalk.red('❌ Invalid `/memory` command. Use: `/memory [list|add|clear]`'));
+          console.log(chalk.red('  Usage: /memory [list|add|clear]'));
         }
         continue;
       }
 
-      console.log(chalk.red(`❌ Unknown command: /${cmd}. Type /help for assistance.`));
+      console.log(chalk.red(`  Unknown command: /${cmd}. Type /help for commands.`));
       continue;
     }
 
@@ -260,38 +316,48 @@ export async function startInteractiveSession(config: Config, initialSessionId?:
           finalPrompt += `\n\nContent of file "${item.path}":\n\`\`\`\n${item.content}\n\`\`\``;
         }
       }
-      console.log(chalk.blue(`📎 Injected context from: ${parsed.injectedContext.map(i => i.path).join(', ')}`));
+      console.log(chalk.dim(`  📎 Context: ${parsed.injectedContext.map(i => i.path).join(', ')}`));
     }
 
     messages.push({ role: 'user', content: finalPrompt });
 
-    // Output formatting setup
-    process.stdout.write(chalk.magenta('\nTadoe: '));
-    let assistantResponse = '';
+    // Track start time for duration display
+    const startTime = Date.now();
 
-    // Run the ReAct agent loop
+    // Run the ReAct agent loop — stream directly to terminal
+    console.log('');
     messages = await runAgentLoop(activeConfig, messages, memory, (chunk) => {
-      // Accumulate raw typing text for later rendering
-      assistantResponse += chunk;
+      // Stream tokens directly inline — no buffering, no double-print
+      process.stdout.write(chunk);
     });
 
+    // After streaming completes, render the final markdown block with left-border
     const assistantMsg = messages[messages.length - 1];
     if (assistantMsg && assistantMsg.role === 'assistant') {
       const markdownAnswer = assistantMsg.content.replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '').trim();
-      
-      // Reprint beautifully rendered markdown to replace raw typing stream
+
       if (markdownAnswer) {
-        console.log('\n' + chalk.gray('━'.repeat(50)));
-        try {
-          process.stdout.write(await marked.parse(markdownAnswer));
-        } catch (e) {
-          process.stdout.write(markdownAnswer);
+        // Clear raw streamed text and reprint with formatting
+        // Move cursor up and clear lines for the raw text, then print formatted
+        const rawLineCount = markdownAnswer.split('\n').length + 1;
+        for (let i = 0; i < rawLineCount; i++) {
+          process.stdout.write('\x1b[A\x1b[2K');
         }
-        console.log(chalk.gray('━'.repeat(50)) + '\n');
+
+        // Print with left-border like Claude CLI
+        process.stdout.write(renderAssistantBlock(markdownAnswer));
+        console.log('');
       }
     }
 
-    // Auto-save session periodically
+    // Duration and token estimate (Claude CLI shows this)
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    const lastAssistant = messages[messages.length - 1];
+    const charCount = lastAssistant?.content?.length || 0;
+    const tokenEstimate = Math.round(charCount / 4);
+    console.log(chalk.dim(`  ${elapsed}s  •  ~${tokenEstimate} tokens\n`));
+
+    // Auto-save session
     saveSession(activeConfig.sessionsDir, sessionId, messages);
   }
 }

@@ -1,6 +1,5 @@
 import { Command } from 'commander';
 import chalk from 'chalk';
-import readline from 'readline';
 
 import { loadConfig, detectActiveModel } from './config.js';
 import { listSessions, ChatMessage } from './sessions.js';

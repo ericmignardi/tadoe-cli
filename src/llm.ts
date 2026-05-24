@@ -117,6 +117,42 @@ export async function streamChatCompletion(
 }
 
 /**
+ * Displays a tool action in Claude CLI compact style.
+ */
+function displayToolAction(name: string, args: any): void {
+  const border = chalk.dim('─'.repeat(40));
+  console.log('');
+  console.log(chalk.dim(`  ┌${border}┐`));
+
+  // Tool name with icon
+  let icon = '🔧';
+  let label = name;
+  if (name === 'read_file') { icon = '📄'; label = `Read ${args.path || 'file'}`; }
+  else if (name === 'write_file') { icon = '✏️'; label = `Write ${args.path || 'file'}`; }
+  else if (name === 'list_dir') { icon = '📁'; label = `List ${args.path || '.'}`; }
+  else if (name === 'run_command') { icon = '⚡'; label = `Run \`${args.command || ''}\``; }
+
+  console.log(chalk.dim(`  │ `) + `${icon} ${chalk.bold.cyan(label)}` + chalk.dim(` │`));
+  console.log(chalk.dim(`  └${border}┘`));
+}
+
+/**
+ * Displays a tool result in Claude CLI compact style.
+ */
+function displayToolResult(result: string, success: boolean): void {
+  const maxPreview = 120;
+  const preview = result.length > maxPreview
+    ? result.slice(0, maxPreview).replace(/\n/g, ' ') + '…'
+    : result.replace(/\n/g, ' ');
+
+  if (success) {
+    console.log(chalk.dim(`  ✓ `) + chalk.dim(preview));
+  } else {
+    console.log(chalk.red(`  ✗ `) + chalk.dim(preview));
+  }
+}
+
+/**
  * Runs the agentic ReAct loop.
  * Continues calling the LLM and executing tools until a final conversational response is reached.
  */
@@ -145,6 +181,7 @@ export async function runAgentLoop(
     turn++;
     let fullResponse = '';
     let lastPrintedIndex = 0;
+    let insideToolCall = false;
 
     // Helper to print streamed chunks without leaking the <tool_call> tags
     const handleChunk = (chunk: string) => {
@@ -169,17 +206,25 @@ export async function runAgentLoop(
           lastPrintedIndex += toPrint.length;
         }
       } else {
-        // Tool call starts. Print everything up to its start
-        if (toolCallIndex > lastPrintedIndex) {
-          const toPrint = fullResponse.slice(lastPrintedIndex, toolCallIndex);
-          onUserOutput(toPrint);
-          lastPrintedIndex += toPrint.length;
+        // Tool call detected — suppress all further output
+        if (!insideToolCall) {
+          // Print everything before the tag
+          if (toolCallIndex > lastPrintedIndex) {
+            const toPrint = fullResponse.slice(lastPrintedIndex, toolCallIndex);
+            onUserOutput(toPrint);
+            lastPrintedIndex += toPrint.length;
+          }
+          insideToolCall = true;
         }
       }
     };
 
-    // Spin up loading indicator if the model is thinking
-    const spinner = ora({ text: 'Thinking...', color: 'magenta' }).start();
+    // Spin up thinking indicator (Claude CLI style: dim text)
+    const spinner = ora({
+      text: chalk.dim('Thinking…'),
+      color: 'magenta',
+      spinner: 'dots',
+    }).start();
 
     try {
       await streamChatCompletion(config, activeMessages, (chunk) => {
@@ -195,14 +240,14 @@ export async function runAgentLoop(
       if (spinner.isSpinning) {
         spinner.stop();
       }
-      console.log(chalk.red(`\n❌ Error communicating with LLM API: ${(err as Error).message}`));
-      console.log(chalk.yellow(`\n🔍 Troubleshooting steps for LM Studio connection:`));
-      console.log(chalk.gray(`   1. Make sure LM Studio is running.`));
-      console.log(chalk.gray(`   2. In LM Studio, click the <Local Server> tab (double-headed arrow icon on the left sidebar).`));
-      console.log(chalk.gray(`   3. Select a model to load from the dropdown at the top of that tab.`));
-      console.log(chalk.gray(`   4. Click the green "Start Server" button. Ensure the status turns to "Stop Server" (meaning it is active).`));
-      console.log(chalk.gray(`   5. Verify that the Server Port in LM Studio is set to 1234. If it's different, set TADOE_API_URL accordingly.`));
-      console.log();
+      console.log(chalk.red(`\n  ❌ Error communicating with LLM API: ${(err as Error).message}`));
+      console.log('');
+      console.log(chalk.yellow(`  Troubleshooting:`));
+      console.log(chalk.dim(`  1. Make sure LM Studio is running.`));
+      console.log(chalk.dim(`  2. Open the Local Server tab in LM Studio.`));
+      console.log(chalk.dim(`  3. Load a model and click "Start Server".`));
+      console.log(chalk.dim(`  4. Verify the server port is 1234.`));
+      console.log('');
       break;
     }
 
@@ -223,7 +268,7 @@ export async function runAgentLoop(
     try {
       toolCall = JSON.parse(jsonStr);
     } catch (e) {
-      console.log(chalk.red(`\n⚠️  Failed to parse tool call JSON: ${(e as Error).message}`));
+      console.log(chalk.red(`\n  ⚠ Failed to parse tool call: ${(e as Error).message}`));
       activeMessages.push({
         role: 'user',
         content: `<tool_result>\nError: Failed to parse tool call JSON. Please use the exact schema and correct syntax.\n</tool_result>`,
@@ -231,15 +276,13 @@ export async function runAgentLoop(
       continue;
     }
 
-    // Inform user of tool invocation
-    console.log(chalk.cyan(`\n🤖 Calling Tool: ${chalk.bold(toolCall.name)} with arguments: ${JSON.stringify(toolCall.arguments)}`));
+    // Display tool action in compact Claude CLI style
+    displayToolAction(toolCall.name, toolCall.arguments);
 
     // Execute tool
     const toolResult = await executeTool(toolCall.name, toolCall.arguments, config.safeMode);
-
-    // Print status
-    const summary = toolResult.length > 250 ? toolResult.slice(0, 250) + '...' : toolResult;
-    console.log(chalk.gray(`   Result: ${summary.replace(/\n/g, ' ')}\n`));
+    const isError = toolResult.startsWith('Error');
+    displayToolResult(toolResult, !isError);
 
     // Feed result back
     activeMessages.push({

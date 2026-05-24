@@ -10,22 +10,22 @@ const LOGO = `
 `;
 
 export function printAsciiLogo() {
-  const lines = LOGO.split('\n');
-  const colors = [
-    chalk.hex('#8A2BE2'), // BlueViolet
-    chalk.hex('#9370DB'), // MediumPurple
-    chalk.hex('#BA55D3'), // MediumOrchid
-    chalk.hex('#DA70D6'), // Orchid
-    chalk.hex('#EE82EE'), // Violet
-    chalk.hex('#FF00FF'), // Magenta
-    chalk.hex('#FF1493'), // DeepPink
+  const lines = LOGO.split('\n').filter(l => l.trim());
+  const gradient = [
+    chalk.hex('#7C3AED'),
+    chalk.hex('#8B5CF6'),
+    chalk.hex('#A78BFA'),
+    chalk.hex('#C4B5FD'),
+    chalk.hex('#A78BFA'),
+    chalk.hex('#8B5CF6'),
+    chalk.hex('#7C3AED'),
   ];
 
-  console.log('\n');
+  console.log('');
   lines.forEach((line, index) => {
-    const color = colors[index % colors.length] || chalk.magenta;
+    const color = gradient[index % gradient.length];
     console.log(color(line));
   });
-  console.log(chalk.gray(`  Tadoe CLI — Local AI Terminal Agent v1.0.0`));
-  console.log(chalk.gray(`  ---------------------------------------------\n`));
+  console.log(chalk.dim(`  v1.0.0 — Local AI Terminal Agent`));
+  console.log('');
 }
