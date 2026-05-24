@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { SECRET_FILE_MODE } from './constants.js';
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
@@ -32,7 +33,7 @@ export function saveSession(sessionsDir: string, sessionId: string, messages: Ch
     lastUpdated: Date.now(),
     messages,
   };
-  fs.writeFileSync(sessionPath(sessionsDir, sessionId), JSON.stringify(data, null, 2), 'utf-8');
+  fs.writeFileSync(sessionPath(sessionsDir, sessionId), JSON.stringify(data, null, 2), { encoding: 'utf-8', mode: SECRET_FILE_MODE });
 }
 
 export function loadSession(sessionsDir: string, sessionId: string): ChatMessage[] {

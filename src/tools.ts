@@ -3,6 +3,15 @@ import path from 'path';
 import { FILE_READ_LIMIT_BYTES, SKIP_DIR_NAMES } from './constants.js';
 import { runShell, formatShellResult } from './shell.js';
 
+function resolveWithinCwd(targetPath: string): { ok: true; resolved: string } | { ok: false; error: string } {
+  const resolved = path.resolve(process.cwd(), targetPath);
+  const rel = path.relative(process.cwd(), resolved);
+  if (rel.startsWith('..') || path.isAbsolute(rel)) {
+    return { ok: false, error: `Error: Path "${targetPath}" escapes the workspace directory. Only paths inside ${process.cwd()} are permitted.` };
+  }
+  return { ok: true, resolved };
+}
+
 export interface ToolParameter {
   type: string;
   properties: Record<string, { type: string; description: string }>;
@@ -36,7 +45,9 @@ export const toolsList: ToolDefinition[] = [
     },
     requiresConfirmation: false,
     execute: async (args: { path: string }) => {
-      const resolvedPath = path.resolve(process.cwd(), args.path);
+      const guard = resolveWithinCwd(args.path);
+      if (!guard.ok) return guard.error;
+      const resolvedPath = guard.resolved;
       if (!fs.existsSync(resolvedPath)) {
         return `Error: File not found at ${resolvedPath}`;
       }
@@ -45,8 +56,14 @@ export const toolsList: ToolDefinition[] = [
         return `Error: Path ${resolvedPath} is a directory, not a file.`;
       }
       if (stat.size > FILE_READ_LIMIT_BYTES) {
-        const content = fs.readFileSync(resolvedPath, 'utf-8');
-        return content.slice(0, FILE_READ_LIMIT_BYTES) + '\n\n... [File content truncated]';
+        const fd = fs.openSync(resolvedPath, 'r');
+        try {
+          const buf = Buffer.alloc(FILE_READ_LIMIT_BYTES);
+          const bytesRead = fs.readSync(fd, buf, 0, FILE_READ_LIMIT_BYTES, 0);
+          return buf.slice(0, bytesRead).toString('utf-8') + '\n\n... [File content truncated]';
+        } finally {
+          fs.closeSync(fd);
+        }
       }
       return fs.readFileSync(resolvedPath, 'utf-8');
     },
@@ -64,7 +81,9 @@ export const toolsList: ToolDefinition[] = [
     },
     requiresConfirmation: true,
     execute: async (args: { path: string; content: string }) => {
-      const resolvedPath = path.resolve(process.cwd(), args.path);
+      const guard = resolveWithinCwd(args.path);
+      if (!guard.ok) return guard.error;
+      const resolvedPath = guard.resolved;
       const dir = path.dirname(resolvedPath);
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
@@ -89,7 +108,9 @@ export const toolsList: ToolDefinition[] = [
     requiresConfirmation: false,
     execute: async (args: { path?: string }) => {
       const targetDir = args.path || '.';
-      const resolvedPath = path.resolve(process.cwd(), targetDir);
+      const guard = resolveWithinCwd(targetDir);
+      if (!guard.ok) return guard.error;
+      const resolvedPath = guard.resolved;
       if (!fs.existsSync(resolvedPath)) {
         return `Error: Directory not found at ${resolvedPath}`;
       }

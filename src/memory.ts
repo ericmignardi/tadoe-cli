@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { SECRET_FILE_MODE } from './constants.js';
 
 export function loadMemory(filePath: string): string {
   if (!fs.existsSync(filePath)) return '';
@@ -16,5 +17,5 @@ export function saveMemory(filePath: string, memory: string): void {
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
-  fs.writeFileSync(filePath, JSON.stringify({ memory }, null, 2), 'utf-8');
+  fs.writeFileSync(filePath, JSON.stringify({ memory }, null, 2), { encoding: 'utf-8', mode: SECRET_FILE_MODE });
 }

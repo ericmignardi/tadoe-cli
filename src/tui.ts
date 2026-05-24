@@ -34,6 +34,43 @@ function renderAssistantBlock(text: string): string {
   }
 }
 
+/** Stateful line-aware writer that prefixes every new line with the magenta border. */
+function createStreamingWriter() {
+  const border = chalk.magenta('│');
+  const prefix = `  ${border} `;
+  let atLineStart = true;
+  let anyOutput = false;
+
+  return {
+    write(chunk: string) {
+      if (!chunk) return;
+      const parts = chunk.split('\n');
+      for (let i = 0; i < parts.length; i++) {
+        const part = parts[i];
+        if (atLineStart && (part.length > 0 || i < parts.length - 1)) {
+          process.stdout.write(prefix);
+          atLineStart = false;
+          anyOutput = true;
+        }
+        if (part) {
+          process.stdout.write(part);
+          anyOutput = true;
+        }
+        if (i < parts.length - 1) {
+          process.stdout.write('\n');
+          atLineStart = true;
+        }
+      }
+    },
+    finish() {
+      if (anyOutput && !atLineStart) process.stdout.write('\n');
+    },
+    didOutput() {
+      return anyOutput;
+    },
+  };
+}
+
 function promptUser(rl: readline.Interface): Promise<string | null> {
   return new Promise(resolve => {
     rl.question(chalk.bold.magenta('\n> '), answer => resolve(answer));
@@ -67,9 +104,10 @@ function displayToolAction(name: string, args: any): void {
 }
 
 function displayToolResult(result: string, success: boolean): void {
-  const preview = result.length > TOOL_RESULT_PREVIEW_CHARS
-    ? result.slice(0, TOOL_RESULT_PREVIEW_CHARS).replace(/\n/g, ' ') + '…'
-    : result.replace(/\n/g, ' ');
+  const firstLine = result.split('\n').find(l => l.trim()) ?? '';
+  const preview = firstLine.length > TOOL_RESULT_PREVIEW_CHARS
+    ? firstLine.slice(0, TOOL_RESULT_PREVIEW_CHARS) + '…'
+    : firstLine;
   console.log(success ? chalk.dim('  ✓ ') + chalk.dim(preview) : chalk.red('  ✗ ') + chalk.dim(preview));
 }
 
@@ -175,7 +213,15 @@ export async function startInteractiveSession(config: Config, initialSessionId?:
         continue;
       }
       const result = handler({ config: activeConfig, args: parsed.args || [], state }) || {};
-      if (result.clear) console.clear();
+      if (result.clear) {
+        console.clear();
+        printAsciiLogo();
+        console.log(
+          chalk.dim('  Model: ') + chalk.bold.white(activeModel)
+          + chalk.dim('  •  ') + chalk.dim(activeConfig.apiUrl)
+        );
+        console.log(chalk.dim(`  Safe mode: ${activeConfig.safeMode ? chalk.green('on') : chalk.red('off')}  •  /help for commands  •  /quit to exit\n`));
+      }
       if (result.exit) {
         exit();
         break;
@@ -200,25 +246,34 @@ export async function startInteractiveSession(config: Config, initialSessionId?:
     const stopSpinner = () => {
       if (spinnerRef.current && spinnerRef.current.isSpinning) spinnerRef.current.stop();
     };
-    let assistantBuffer = '';
+    let writer = createStreamingWriter();
+
+    const controller = new AbortController();
+    let cancelled = false;
+    const onSigint = () => {
+      if (cancelled) return;
+      cancelled = true;
+      controller.abort();
+      stopSpinner();
+      console.log(chalk.yellow('\n  ⚠ Cancelled — returning to prompt.\n'));
+    };
+    process.on('SIGINT', onSigint);
 
     const hooks: AgentHooks = {
       onTurnStart: () => {
         spinnerRef.current = ora({ text: chalk.dim('Thinking…'), color: 'magenta', spinner: 'dots' }).start();
-        assistantBuffer = '';
+        writer = createStreamingWriter();
+      },
+      onFirstToken: () => {
+        stopSpinner();
       },
       onAssistantChunk: chunk => {
-        assistantBuffer += chunk;
+        stopSpinner();
+        writer.write(chunk);
       },
       onToolStart: (name, args) => {
         stopSpinner();
-        // Flush any prelude assistant text before the tool call
-        if (assistantBuffer.trim()) {
-          console.log('');
-          process.stdout.write(renderAssistantBlock(assistantBuffer.trim()));
-          console.log('');
-          assistantBuffer = '';
-        }
+        writer.finish();
         displayToolAction(name, args);
       },
       onToolResult: (_name, result, success) => {
@@ -233,22 +288,22 @@ export async function startInteractiveSession(config: Config, initialSessionId?:
         displayApiError(err);
       },
       confirm: activeConfig.safeMode ? confirmTool : undefined,
+      signal: controller.signal,
     };
 
     console.log('');
-    state.messages = await runAgentLoop(activeConfig, state.messages, state.memory, hooks);
-    stopSpinner();
-
-    // Render the final assistant message (last turn, no tool call).
-    if (assistantBuffer.trim()) {
-      process.stdout.write(renderAssistantBlock(assistantBuffer.trim()));
-      console.log('');
+    try {
+      state.messages = await runAgentLoop(activeConfig, state.messages, state.memory, hooks);
+    } finally {
+      process.off('SIGINT', onSigint);
     }
+    stopSpinner();
+    writer.finish();
 
     const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-    const lastAssistant = state.messages[state.messages.length - 1];
-    const tokenEstimate = Math.round((lastAssistant?.content?.length || 0) / 4);
-    console.log(chalk.dim(`  ${elapsed}s  •  ~${tokenEstimate} tokens\n`));
+    const totalChars = state.messages.reduce((acc, m) => acc + (m.content?.length || 0), 0);
+    const tokenEstimate = Math.round(totalChars / 4);
+    console.log(chalk.dim(`  ${elapsed}s  •  ~${tokenEstimate} tokens (session)\n`));
 
     saveSession(activeConfig.sessionsDir, state.sessionId, state.messages);
   }

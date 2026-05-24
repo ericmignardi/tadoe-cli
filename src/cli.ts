@@ -6,6 +6,7 @@ import { listSessions, ChatMessage } from './sessions.js';
 import { startInteractiveSession } from './tui.js';
 import { loadMemory } from './memory.js';
 import { runAgentLoop } from './llm.js';
+import { ConfirmHook } from './tools.js';
 
 function readStdin(): Promise<string> {
   return new Promise(resolve => {
@@ -72,9 +73,32 @@ export async function runCli() {
     const messages: ChatMessage[] = [{ role: 'user', content: promptContent }];
     const memory = loadMemory(activeConfig.memoryFile);
 
-    await runAgentLoop(activeConfig, messages, memory, {
-      onAssistantChunk: chunk => process.stdout.write(chunk),
-    });
+    // In non-interactive mode there is no human to confirm prompts. When safe
+    // mode is on (default), auto-deny tools that require confirmation. Users
+    // who want to script tool execution must pass --no-safe explicitly.
+    const nonInteractiveConfirm: ConfirmHook | undefined = activeConfig.safeMode
+      ? async (name: string) => {
+          process.stderr.write(
+            chalk.yellow(
+              `[safe-mode] Auto-denied tool "${name}" in non-interactive mode. Re-run with --no-safe to allow.\n`,
+            ),
+          );
+          return false;
+        }
+      : undefined;
+
+    const controller = new AbortController();
+    const onSigint = () => controller.abort();
+    process.on('SIGINT', onSigint);
+    try {
+      await runAgentLoop(activeConfig, messages, memory, {
+        onAssistantChunk: chunk => process.stdout.write(chunk),
+        confirm: nonInteractiveConfirm,
+        signal: controller.signal,
+      });
+    } finally {
+      process.off('SIGINT', onSigint);
+    }
 
     process.stdout.write('\n');
     return;

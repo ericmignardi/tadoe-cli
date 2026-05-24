@@ -1,5 +1,5 @@
 import { exec } from 'child_process';
-import { SHELL_EXEC_TIMEOUT_MS } from './constants.js';
+import { SHELL_EXEC_TIMEOUT_MS, SHELL_EXEC_MAX_BUFFER } from './constants.js';
 
 export interface ShellResult {
   stdout: string;
@@ -10,7 +10,7 @@ export interface ShellResult {
 
 export function runShell(command: string, timeoutMs: number = SHELL_EXEC_TIMEOUT_MS): Promise<ShellResult> {
   return new Promise((resolve) => {
-    exec(command, { timeout: timeoutMs }, (error, stdout, stderr) => {
+    exec(command, { timeout: timeoutMs, maxBuffer: SHELL_EXEC_MAX_BUFFER }, (error, stdout, stderr) => {
       resolve({
         stdout: stdout || '',
         stderr: stderr || '',

@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { DIR_TREE_MAX_DEPTH, SKIP_DIR_NAMES } from './constants.js';
+import { DIR_TREE_MAX_DEPTH, FILE_READ_LIMIT_BYTES, SKIP_DIR_NAMES } from './constants.js';
 
 export interface InjectedContext {
   path: string;
@@ -59,11 +59,20 @@ export async function parseInput(input: string, baseDir: string = process.cwd())
     try {
       const stat = fs.statSync(absolutePath);
       if (stat.isFile()) {
-        resolvedContexts.push({
-          path: targetPath,
-          content: fs.readFileSync(absolutePath, 'utf-8'),
-          isDir: false,
-        });
+        let content: string;
+        if (stat.size > FILE_READ_LIMIT_BYTES) {
+          const fd = fs.openSync(absolutePath, 'r');
+          try {
+            const buf = Buffer.alloc(FILE_READ_LIMIT_BYTES);
+            const bytesRead = fs.readSync(fd, buf, 0, FILE_READ_LIMIT_BYTES, 0);
+            content = buf.slice(0, bytesRead).toString('utf-8') + '\n\n... [File content truncated]';
+          } finally {
+            fs.closeSync(fd);
+          }
+        } else {
+          content = fs.readFileSync(absolutePath, 'utf-8');
+        }
+        resolvedContexts.push({ path: targetPath, content, isDir: false });
       } else if (stat.isDirectory()) {
         resolvedContexts.push({
           path: targetPath,

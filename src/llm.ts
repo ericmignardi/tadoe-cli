@@ -26,6 +26,8 @@ export interface AgentHooks {
   onFirstToken?: () => void;
   /** Confirm tool execution; defaults to allow-all. */
   confirm?: ConfirmHook;
+  /** Abort signal used to cancel an in-flight turn. */
+  signal?: AbortSignal;
 }
 
 function buildSystemPrompt(workspaceDir: string, memory?: string): string {
@@ -75,6 +77,7 @@ export async function streamChatCompletion(
   config: Config,
   messages: ChatMessage[],
   onChunk: (chunk: string) => void,
+  signal?: AbortSignal,
 ): Promise<string> {
   const response = await fetch(`${config.apiUrl.replace(/\/$/, '')}/chat/completions`, {
     method: 'POST',
@@ -88,6 +91,7 @@ export async function streamChatCompletion(
       stream: true,
       temperature: 0.1,
     }),
+    signal,
   });
 
   if (!response.ok) {
@@ -134,11 +138,19 @@ export async function streamChatCompletion(
 /**
  * Stateful filter: forwards streamed assistant text to `emit` while suppressing
  * any text from `<tool_call>` onward (including a partial tag at the buffer tail).
+ * Periodically compacts the buffer to keep memory bounded on long turns.
  */
 function createToolCallFilter(emit: (text: string) => void) {
   let buffer = '';
   let printedTo = 0;
   let suppressing = false;
+
+  const compact = () => {
+    if (printedTo > 4096) {
+      buffer = buffer.slice(printedTo);
+      printedTo = 0;
+    }
+  };
 
   return (chunk: string) => {
     buffer += chunk;
@@ -164,8 +176,11 @@ function createToolCallFilter(emit: (text: string) => void) {
       emit(buffer.slice(printedTo, safeEnd));
       printedTo = safeEnd;
     }
+    compact();
   };
 }
+
+const USER_DENIED_PREFIX = 'Error: User denied permission';
 
 export async function runAgentLoop(
   config: Config,
@@ -182,7 +197,10 @@ export async function runAgentLoop(
     activeMessages.unshift({ role: 'system', content: systemPrompt });
   }
 
+  let lastToolSignature: string | null = null;
+
   for (let turn = 1; turn <= AGENT_MAX_TURNS; turn++) {
+    if (hooks.signal?.aborted) break;
     hooks.onTurnStart?.(turn);
 
     let fullResponse = '';
@@ -197,9 +215,14 @@ export async function runAgentLoop(
         }
         fullResponse += chunk;
         filter(chunk);
-      });
+      }, hooks.signal);
     } catch (err) {
-      hooks.onApiError?.(err as Error);
+      const e = err as Error & { name?: string };
+      if (e?.name === 'AbortError' || hooks.signal?.aborted) {
+        if (fullResponse) activeMessages.push({ role: 'assistant', content: fullResponse });
+        break;
+      }
+      hooks.onApiError?.(e);
       break;
     }
 
@@ -221,6 +244,16 @@ export async function runAgentLoop(
       continue;
     }
 
+    const toolSignature = `${toolCall.name}:${JSON.stringify(toolCall.arguments)}`;
+    if (toolSignature === lastToolSignature) {
+      activeMessages.push({
+        role: 'user',
+        content: `${TOOL_RESULT_OPEN}\nError: Identical tool call repeated. Stop calling the same tool with the same arguments and answer the user directly.\n${TOOL_RESULT_CLOSE}`,
+      });
+      break;
+    }
+    lastToolSignature = toolSignature;
+
     hooks.onToolStart?.(toolCall.name, toolCall.arguments);
     const toolResult = await executeTool(toolCall.name, toolCall.arguments, hooks.confirm);
     const success = !toolResult.startsWith('Error');
@@ -230,6 +263,8 @@ export async function runAgentLoop(
       role: 'user',
       content: `${TOOL_RESULT_OPEN}\n${toolResult}\n${TOOL_RESULT_CLOSE}`,
     });
+
+    if (toolResult.startsWith(USER_DENIED_PREFIX)) break;
   }
 
   return activeMessages;
