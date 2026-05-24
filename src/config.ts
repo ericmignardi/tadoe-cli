@@ -19,7 +19,7 @@ export interface Config {
 const TADOE_DIR = path.join(os.homedir(), '.tadoe');
 
 const DEFAULTS: Config = {
-  apiUrl: 'http://localhost:1234/v1',
+  apiUrl: 'http://127.0.0.1:1234/v1',
   apiKey: 'lm-studio',
   model: 'auto',
   safeMode: true,
@@ -45,7 +45,10 @@ export function loadConfig(): Config {
   }
 
   // Load from environment or fall back to fileConfig / DEFAULTS
-  const apiUrl = process.env.TADOE_API_URL || fileConfig.apiUrl || DEFAULTS.apiUrl;
+  let apiUrl = process.env.TADOE_API_URL || fileConfig.apiUrl || DEFAULTS.apiUrl;
+  if (apiUrl.includes('localhost:1234')) {
+    apiUrl = apiUrl.replace('localhost:1234', '127.0.0.1:1234');
+  }
   const apiKey = process.env.TADOE_API_KEY || fileConfig.apiKey || DEFAULTS.apiKey;
   const model = process.env.TADOE_MODEL || fileConfig.model || DEFAULTS.model;
   
